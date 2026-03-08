@@ -7,7 +7,8 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
 import openpyxl
 from openpyxl.chart import LineChart, Reference
-import time
+
+EXPECTED_COLUMNS = ['Date', 'Opening', 'High', 'Low', 'Closing Price', 'Change %', 'Change Nominal', 'Volume']
 
 def init_driver():
     """Initialize the Selenium WebDriver."""
@@ -31,22 +32,67 @@ def scrape_stock_data(driver, ticker):
         current_url = f"{base_url}&l={page_number}" if page_number > 1 else base_url
         driver.get(current_url)
         consent_if_needed(driver, page_number)
-        
+
         # Wait for the dynamic content to load
-        time.sleep(5)  # Adjust this delay as necessary
-        
-        rows = driver.find_elements(By.XPATH, "//table[@id='fth1']/tbody/tr")
+        rows = wait_for_table_rows(driver)
+
         if not rows or len(data) >= 360:
             break
+
+        rows_added = 0
         for row in rows:
             cells = row.find_elements(By.TAG_NAME, 'td')
-            if len(cells) == 9:  # Ensuring row has all data
-                row_data = [cell.text for cell in cells[1:]]  # Skip first cell (index)
+            row_data = normalize_row_data(cells)
+            if row_data is not None:
                 data.append(row_data)
+                rows_added += 1
+
+        # If a page no longer provides compatible rows, stop paginating.
+        if rows_added == 0:
+            break
+
         page_number += 1
-    
-    columns = ['Date', 'Opening', 'High', 'Low', 'Closing Price', 'Change %', 'Change Nominal', 'Volume']
-    return pd.DataFrame(data, columns=columns)
+
+    return pd.DataFrame(data, columns=EXPECTED_COLUMNS)
+
+
+def wait_for_table_rows(driver, timeout=15):
+    """Wait for quote table rows to appear and return them."""
+    try:
+        WebDriverWait(driver, timeout).until(
+            EC.presence_of_element_located((By.XPATH, "//table[@id='fth1']/tbody/tr"))
+        )
+    except TimeoutException:
+        return []
+    return driver.find_elements(By.XPATH, "//table[@id='fth1']/tbody/tr")
+
+
+def normalize_row_data(cells):
+    """
+    Normalize table row values to match EXPECTED_COLUMNS.
+
+    The stooq table layout has changed over time. Some variants include an
+    initial index column and some have fewer metrics. This function pads or
+    trims values so downstream processing remains stable.
+    """
+    if not cells:
+        return None
+
+    row_values = [cell.text.strip() for cell in cells]
+
+    # Skip leading numeric index column if present.
+    if row_values and row_values[0].isdigit():
+        row_values = row_values[1:]
+
+    if len(row_values) < 2:
+        return None
+
+    if len(row_values) < len(EXPECTED_COLUMNS):
+        row_values += [''] * (len(EXPECTED_COLUMNS) - len(row_values))
+    elif len(row_values) > len(EXPECTED_COLUMNS):
+        row_values = row_values[:len(EXPECTED_COLUMNS)]
+
+    return row_values
 
 def consent_if_needed(driver, page_number):
     """
@@ -70,6 +116,12 @@ def process_data_frame(df):
     Args:
         df: The pandas DataFrame to process.
     """
+    if df.empty:
+        raise RuntimeError(
+            "No stock rows were scraped. The website layout may have changed "
+            "or anti-bot protection blocked the table data."
+        )
+
     df['Date'] = df['Date'].apply(translate_date)
     df['Closing Price'] = pd.to_numeric(df['Closing Price'].str.replace(',', '.'), errors='coerce')
 
@@ -94,6 +146,10 @@ def save_to_excel(df, ticker):
     for i, days in enumerate([30, 180, 360], start=1):
         start_row = max(2, ws_data.max_row - days + 1)
         end_row = ws_data.max_row
+
+        if start_row > end_row:
+            continue
+
         data = Reference(ws_data, min_col=5, min_row=start_row, max_row=end_row)
         categories = Reference(ws_data, min_col=1, min_row=start_row, max_row=end_row)
 
@@ -121,7 +177,11 @@ def translate_date(date_str):
         'maj': '05', 'cze': '06', 'lip': '07', 'sie': '08',
         'wrz': '09', 'paź': '10', 'lis': '11', 'gru': '12'
     }
-    day, month_abbr, year = date_str.split()
+    parts = date_str.replace('.', '').split()
+    if len(parts) != 3:
+        return date_str
+
+    day, month_abbr, year = parts
     month = polish_to_english[month_abbr.lower()]
     return f"{year}-{month}-{day.zfill(2)}"
 
